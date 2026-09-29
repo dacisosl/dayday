@@ -1,0 +1,18 @@
+{
+  "name": "하루 — AI 일기",
+  "short_name": "하루",
+  "description": "말하듯 기록하고, AI가 정리해 주는 일기장",
+  "lang": "ko",
+  "id": "./diary.html",
+  "start_url": "./diary.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f6f3ed",
+  "theme_color": "#f6f3ed",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
