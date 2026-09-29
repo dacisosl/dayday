@@ -1,5 +1,5 @@
 // 하루 서비스 워커 — 앱 화면은 오프라인에서도 열리게, AI·DB 요청은 건드리지 않음
-const VERSION = 'haru-v1';
+const VERSION = 'haru-v2';
 const SHELL = ['./', './index.html', './diary.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

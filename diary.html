@@ -251,6 +251,7 @@
   .field input:focus { outline: none; border-color: var(--accent); }
   .btn-row { display: flex; flex-wrap: wrap; gap: 10px; }
   .desc { color: var(--ink-2); font-size: .93rem; line-height: 1.8; margin: 0 0 14px; }
+  .desc.sync-status { margin: 14px 0 0; color: var(--muted); }
 
   /* ── 오버레이 · 토스트 ── */
   #overlay {
@@ -307,6 +308,9 @@ const DEFAULT_CFG = {
   imageModel: 'google/gemini-3.1-flash-image',
 };
 const API = 'https://openrouter.ai/api/v1/chat/completions';
+// 기기 동기화 서버 (Supabase). 공개돼도 되는 값 — 실제 잠금은 각 기기의 동기화 키.
+const SUPABASE_URL = '';
+const SUPABASE_KEY = '';
 const TYPES = ['사람', '일', '관심사', '장소', '감정', '다짐'];
 const TYPE_COLOR = { 사람: '#c4846c', 일: '#7d90aa', 관심사: '#8ea477', 장소: '#b89a5c', 감정: '#aa85a2', 다짐: '#6c9d98' };
 const WEEKDAYS = ['일요일', '월요일', '화요일', '수요일', '목요일', '금요일', '토요일'];
@@ -400,10 +404,126 @@ function sortEntries() {
   graphCache = null;
 }
 async function loadEntries() {
-  try { entries = (await db.all()) || []; } catch (e) { entries = []; toast('저장소를 열지 못했어요: ' + e.message); }
+  try { entries = ((await db.all()) || []).filter(e => !e.deleted); } catch (e) { entries = []; toast('저장소를 열지 못했어요: ' + e.message); }
   sortEntries();
 }
 const byId = id => entries.find(e => e.id === id);
+
+/** 로컬 변경은 모두 여기로 — 수정 시각·동기화 표시를 남기고 동기화 예약 */
+async function saveEntries(list) {
+  const now = new Date().toISOString();
+  list.forEach(e => { e.updated = now; e.dirty = true; });
+  await db.putMany(list);
+  scheduleSync();
+}
+async function removeEntry(id) {
+  await saveEntries([{ id, deleted: true }]);   // 다른 기기에도 삭제가 전해지도록 표시만 남김
+  entries = entries.filter(x => x.id !== id);
+  sortEntries();
+}
+
+/* ───────────── 기기 동기화 (동기화 키) ───────────── */
+const SYNC_FIELDS = ['date', 'weekday', 'summary', 'body', 'image', 'entities', 'links', 'keep', 'messages', 'created'];
+const syncConfigured = () => !!(SUPABASE_URL && SUPABASE_KEY);
+const syncReady = () => syncConfigured() && (cfg.syncKey || '').length >= 24;
+const sync = { job: null, again: false, timer: null, error: null, onChange: null };
+
+function newSyncKey() {
+  const b = crypto.getRandomValues(new Uint8Array(24));
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function rpc(fn, args) {
+  const hd = { 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json' };
+  if (SUPABASE_KEY.startsWith('eyJ')) hd.Authorization = 'Bearer ' + SUPABASE_KEY;  // 예전 anon(JWT) 키
+  const res = await fetch(`${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/rpc/${fn}`, { method: 'POST', headers: hd, body: JSON.stringify(args) });
+  if (!res.ok) {
+    let m = `HTTP ${res.status}`;
+    try { const j = await res.json(); m = j.message || m; } catch {}
+    throw new Error(m);
+  }
+  return res.json();
+}
+const ms = t => (t ? new Date(t).getTime() : 0);
+
+async function runSync() {
+  let changed = false;
+  const local = new Map(((await db.all()) || []).map(e => [e.id, e]));
+
+  // 1) 받아오기 — 다른 기기에서 더 최근에 고친 것만 반영
+  let cur = LS.get('syncCursor', null);
+  for (;;) {
+    const rows = await rpc('haru_pull', { p_key: cfg.syncKey, p_since: cur?.at ?? null, p_after_id: cur?.id ?? '' });
+    if (!rows.length) break;
+    const puts = [];
+    for (const r of rows) {
+      const l = local.get(r.id);
+      if (l && ms(l.updated || l.created) >= ms(r.updated)) continue;
+      const e = r.deleted ? { id: r.id, deleted: true, updated: r.updated } : { ...r.data, id: r.id, updated: r.updated };
+      puts.push(e);
+      local.set(r.id, e);
+      changed = true;
+    }
+    if (puts.length) await db.putMany(puts);
+    const last = rows[rows.length - 1];
+    cur = { at: last.synced_at, id: last.id };
+    LS.set('syncCursor', cur);
+    if (rows.length < 50) break;
+  }
+
+  // 2) 올리기 — 이 기기에서 바뀐 것
+  const dirty = [...local.values()].filter(e => e.dirty);
+  for (let i = 0; i < dirty.length; i += 8) {
+    const batch = dirty.slice(i, i + 8);
+    await rpc('haru_push', {
+      p_key: cfg.syncKey,
+      p_rows: batch.map(e => ({
+        id: e.id, updated: e.updated || e.created || new Date().toISOString(), deleted: !!e.deleted,
+        data: e.deleted ? {} : Object.fromEntries(SYNC_FIELDS.map(k => [k, e[k] ?? null])),
+      })),
+    });
+    batch.forEach(e => { delete e.dirty; });
+    await db.putMany(batch);
+  }
+
+  LS.set('syncAt', new Date().toISOString());
+  if (changed) {
+    await loadEntries();
+    refreshAfterSync();
+  }
+}
+
+function requestSync() {
+  if (!syncReady() || !navigator.onLine) return Promise.resolve();
+  if (sync.job) { sync.again = true; return sync.job; }
+  sync.error = null;
+  sync.job = runSync()
+    .catch(e => { sync.error = e.message; console.warn('동기화 실패', e); })
+    .finally(() => {
+      sync.job = null;
+      sync.onChange?.();
+      if (sync.again) { sync.again = false; requestSync(); }
+    });
+  sync.onChange?.();
+  return sync.job;
+}
+function scheduleSync() {
+  clearTimeout(sync.timer);
+  sync.timer = setTimeout(requestSync, 1200);
+}
+/** 동기화 키를 새로 넣으면 이 기기의 기록을 전부 올리고 처음부터 받아옴 */
+async function resetSync() {
+  LS.del('syncCursor');
+  const all = (await db.all()) || [];
+  all.forEach(e => { e.dirty = true; e.updated ||= e.created || new Date().toISOString(); });
+  if (all.length) await db.putMany(all);
+  return requestSync();
+}
+function refreshAfterSync() {
+  const page = location.hash.replace(/^#\/?/, '').split('/')[0];
+  if (!['', 'list', 'entry', 'drawer'].includes(page)) return;
+  if ([...document.querySelectorAll('textarea')].some(t => t.value.trim())) return;  // 쓰던 글은 지키기
+  route();
+}
 
 /* ───────────── 기억 서랍 (그래프) ───────────── */
 function buildGraph(list) {
@@ -912,7 +1032,7 @@ async function finish() {
     overlay('하루를 그림으로 그리고 있어요', '조금만 기다려 주세요');
     try { entry.image = await genImage(`${str(j.image_prompt) || entry.summary}. ${IMAGE_STYLE}`); }
     catch (e) { console.warn('이미지 생성 실패', e); }
-    await db.put(entry);
+    await saveEntries([entry]);
     entries.push(entry);
     sortEntries();
     draft = null;
@@ -972,9 +1092,7 @@ function viewEntry(id) {
     h('button', {
       class: 'danger-btn', onclick: async () => {
         if (!confirm('이 기록을 삭제할까요? 되돌릴 수 없어요.')) return;
-        await db.del(e.id);
-        entries = entries.filter(x => x.id !== e.id);
-        sortEntries();
+        await removeEntry(e.id);
         toast('삭제했어요.');
         location.hash = '#/list';
       },
@@ -1047,7 +1165,7 @@ function viewSettings() {
   const img = h('input', { value: cfg.imageModel, list: 'image-models', spellcheck: 'false' });
 
   const save = () => {
-    cfg = { key: key.value.trim(), chatModel: chat.value.trim() || DEFAULT_CFG.chatModel, imageModel: img.value.trim() || DEFAULT_CFG.imageModel };
+    cfg = { ...cfg, key: key.value.trim(), chatModel: chat.value.trim() || DEFAULT_CFG.chatModel, imageModel: img.value.trim() || DEFAULT_CFG.imageModel };
     LS.set('cfg', cfg);
     chat.value = cfg.chatModel; img.value = cfg.imageModel;
     toast('저장했어요.');
@@ -1061,8 +1179,8 @@ function viewSettings() {
       const data = JSON.parse(await f.text());
       const list = (Array.isArray(data) ? data : data.entries || []).filter(e => e && e.id && /^\d{4}-\d{2}-\d{2}$/.test(e.date));
       if (!list.length) throw new Error('불러올 기록이 없어요.');
-      list.forEach(e => { e.weekday ||= weekdayOf(e.date); });
-      await db.putMany(list);
+      list.forEach(e => { e.weekday ||= weekdayOf(e.date); delete e.deleted; });
+      await saveEntries(list);
       await loadEntries();
       toast(`${list.length}개의 기록을 불러왔어요.`);
       route();
@@ -1091,7 +1209,7 @@ function viewSettings() {
         e.entities = normEntities(j.entities);
         e.links = normLinks(j.links, e.entities);
         if (!e.keep) e.keep = str(j.keep);
-        await db.put(e);
+        await saveEntries([e]);
         graphCache = null;
         done++;
       } catch (err) { console.warn(err); }
@@ -1100,6 +1218,54 @@ function viewSettings() {
     toast(`${done}개의 기록을 서랍에 정리했어요.`);
     route();
   };
+
+  // ── 기기 동기화 ──
+  const syncCard = h('section', { class: 'card' }, h('h2', { class: 'label' }, '기기 동기화'));
+  if (!syncConfigured()) {
+    syncCard.append(h('p', { class: 'desc' }, '아직 동기화 서버가 연결되지 않았어요. 지금은 이 기기에만 저장돼요.'));
+  } else {
+    const skey = h('input', { type: 'password', value: cfg.syncKey || '', placeholder: '동기화 키', autocomplete: 'off', spellcheck: 'false' });
+    const status = h('p', { class: 'desc sync-status', 'aria-live': 'polite' });
+    const renderStatus = () => {
+      if (sync.onChange === renderStatus && !status.isConnected && status.dataset.shown) { sync.onChange = null; return; }
+      status.dataset.shown = '1';
+      const at = LS.get('syncAt', null);
+      status.textContent = !syncReady() ? '키를 넣고 저장하면 동기화가 시작돼요.'
+        : sync.job ? '동기화하는 중…'
+        : sync.error ? '동기화하지 못했어요. ' + sync.error
+        : at ? `마지막 동기화: ${new Date(at).toLocaleString('ko-KR', { month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
+        : '아직 동기화하지 않았어요.';
+    };
+    sync.onChange = renderStatus;
+    renderStatus();
+
+    const saveKey = async () => {
+      const v = skey.value.trim();
+      if (v && v.length < 24) { toast('동기화 키는 24자 이상이어야 해요.'); return; }
+      const changed = v !== (cfg.syncKey || '');
+      cfg = { ...cfg, syncKey: v };
+      LS.set('cfg', cfg);
+      if (!v) { toast('동기화를 껐어요. 기록은 이 기기에 남아 있어요.'); renderStatus(); return; }
+      toast('저장했어요. 동기화를 시작할게요.');
+      if (changed) await resetSync(); else await requestSync();
+      if (!sync.error) toast('동기화했어요.');
+    };
+    const gen = () => { skey.value = newSyncKey(); skey.type = 'text'; toast('새 키를 만들었어요. 저장을 눌러 주세요.'); };
+    const copy = async () => {
+      if (!skey.value) return;
+      try { await navigator.clipboard.writeText(skey.value); toast('키를 복사했어요.'); }
+      catch { skey.type = 'text'; skey.select(); toast('키를 선택했어요. 직접 복사해 주세요.'); }
+    };
+    syncCard.append(
+      h('p', { class: 'desc' }, '폰과 PC에 같은 동기화 키를 넣으면 기록이 이어져요. 처음이라면 "새 키 만들기"를 누르고, 다른 기기에는 그 키를 복사해 넣으세요.'),
+      field('동기화 키', skey, '이 키가 곧 일기장의 열쇠예요. 잃어버리면 되찾을 수 없고, 남에게 알려 주면 일기를 볼 수 있으니 안전한 곳에 적어 두세요.'),
+      h('div', { class: 'btn-row' },
+        h('button', { class: 'pill', onclick: saveKey }, '저장하고 동기화'),
+        h('button', { class: 'pill ghost', onclick: gen }, '새 키 만들기'),
+        h('button', { class: 'pill ghost', onclick: copy }, '복사'),
+        h('button', { class: 'pill ghost', onclick: () => { skey.type = skey.type === 'password' ? 'text' : 'password'; } }, '보기')),
+      status);
+  }
 
   app.append(h('div', { class: 'wrap' },
     h('div', { class: 'page-head' }, h('h1', { class: 'page-title' }, '설정')),
@@ -1113,6 +1279,7 @@ function viewSettings() {
       h('datalist', { id: 'image-models' },
         ['google/gemini-3.1-flash-image', 'google/gemini-3.1-flash-lite-image', 'google/gemini-2.5-flash-image'].map(v => h('option', { value: v }))),
       h('div', { class: 'btn-row' }, h('button', { class: 'pill', onclick: save }, '저장'))),
+    syncCard,
     h('section', { class: 'card' },
       h('h2', { class: 'label' }, '내 기록'),
       h('p', { class: 'desc' }, `일기 ${entries.length}개가 이 브라우저에만 저장되어 있어요. 브라우저 데이터를 지우면 사라지니, 가끔 백업해 두세요.`),
@@ -1129,7 +1296,10 @@ function viewSettings() {
 }
 
 /* ───────────── 시작 ───────────── */
-loadEntries().then(route);
+loadEntries().then(() => { route(); requestSync(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestSync(); });
+window.addEventListener('online', () => requestSync());
+setInterval(() => { if (document.visibilityState === 'visible') requestSync(); }, 3 * 60 * 1000);
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(e => console.warn('서비스 워커 등록 실패', e));
 }
